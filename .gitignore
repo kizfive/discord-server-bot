@@ -53,3 +53,5 @@ logs/
 # 本地测试文件
 test_local.py
 debug/
+
+bot.py
