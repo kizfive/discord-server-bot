@@ -73,10 +73,22 @@ async def on_ready():
 @client.event
 async def on_message(message: discord.Message):
     """监听消息事件：检测是否含有链接，没有则删除并发送短暂提示"""
+    # 跳过 Bot 消息
     if message.author.bot:
         return
+    
+    # 跳过非目标频道的消息
     if CHANNEL_ID and message.channel.id != CHANNEL_ID:
         return
+    
+    # 跳过频道主和管理员的消息
+    if hasattr(message, 'author') and hasattr(message.author, 'guild_permissions'):
+        # 排除服务器所有者、管理员、或拥有"管理消息"权限的用户
+        if (message.author.guild_permissions.administrator or 
+            message.author.guild_permissions.manage_messages):
+            return
+    
+    # 消息包含链接则跳过
     if message_has_link(message):
         return
     
@@ -88,7 +100,7 @@ async def on_message(message: discord.Message):
         # 发送临时提示消息（5秒后自动删除）
         try:
             tip = await message.channel.send(
-                f'{message.author.mention} 此频道仅允许发送包含链接的消息，请勿闲聊。'
+                f'{message.author.mention} 此频道仅允许发送包含链接的消息。\nThis channel only allows messages with links.'
             )
             # 5秒后删除提示
             await asyncio.sleep(5)
