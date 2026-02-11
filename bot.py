@@ -11,7 +11,7 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ==================== 配置区域 ====================
-TOKEN = 'MTQ3MDk1NDY2NjQ4ODc2MjQwMA.G8jJHC.ElSiXImrQjxdp48qZ9yU2tSgD9ybU-jqzitYnA'
+TOKEN = 'MTQ3MDk1NDY2NjQ4ODc2MjQwMA.G8jJHC.ElSiXImrQjxdp48qZ9yU2tSgD9ybU-jqzitYnA(已更改api)'
 PROXY = "http://127.0.0.1:7897"  # 请确保端口正确
 TARGET_CHANNEL_ID = 1468099833788370957 
 # =================================================
