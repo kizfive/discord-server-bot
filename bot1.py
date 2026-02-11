@@ -7,6 +7,9 @@ import aiohttp
 import socket
 import asyncio
 
+# --- URL 检测正则表达式 ---
+URL_PATTERN = re.compile(r'https?://|www\.', re.IGNORECASE)
+
 # --- 从环境变量读取配置（启动时必须设置）---
 TOKEN = os.getenv('DISCORD_TOKEN')
 try:
