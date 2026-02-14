@@ -96,11 +96,11 @@ except Exception:
 
 
 def message_has_link(message: discord.Message) -> bool:
-    """检查消息是否包含链接：通过文本内的 URL、附件、或嵌入内容中的链接"""
+    """检查消息是否包含链接：仅通过文本内的 URL 判断（不包括纯附件）"""
+    # 只检查文本内容中的 URL
     if message.content and URL_PATTERN.search(message.content):
         return True
-    if message.attachments:
-        return True
+    # 嵌入内容中的链接
     for emb in message.embeds:
         try:
             parts = []
@@ -246,19 +246,33 @@ async def on_message(message: discord.Message):
         # 发送删除操作日志到指定用户
         await send_dm_log(message, "删除无链接消息", "✅ 消息已成功删除")
         
-        # 发送临时提示消息（5秒后自动删除）
+        # 在频道中发送删除提醒 Embed（仅用户短时间内可见）
         try:
-            tip = await message.channel.send(
-                f'{message.author.mention} 此频道仅允许发送包含链接的消息，请勿闲聊。'
+            reminder_embed = discord.Embed(
+                title="❌ 消息已删除",
+                description="你的消息因为不符合频道规则而被删除。",
+                color=discord.Color.red(),
+                timestamp=datetime.now()
             )
-            logger.info(f"✅ 提示消息已发送")
+            reminder_embed.add_field(
+                name="📋 规则",
+                value="此频道仅允许发送包含链接的消息。",
+                inline=False
+            )
+            # reminder_embed.add_field(
+            #     name="✅ 解决办法",
+            #     value="发送一条**包含链接的消息**后，你将获得40秒的豁免期，期间可以发送任何内容（包括纯图片）。",
+            #    inline=False
+            # )
+            reminder_embed.set_footer(text="此提醒将在5秒后自动删除")
             
-            # 5秒后删除提示
-            await asyncio.sleep(5)
-            await tip.delete()
-            logger.info(f"✅ 提示消息已自动删除（5秒后）")
-        except Exception as e:
-            logger.warning(f"⚠️ 警告：无法发送或删除提示消息 - {e}")
+            # 在频道发送提醒给用户
+            tip = await message.channel.send(
+                f'{message.author.mention}',
+                embed=reminder_embed,
+                delete_after=5  # 5秒后自动删除提醒
+            )
+            logger.info(f"✅ 删除提醒 Embed 已发送")
     
     except Forbidden:
         error_msg = (
