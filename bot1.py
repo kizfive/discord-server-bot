@@ -337,6 +337,8 @@ async def on_message(message: discord.Message):
                 delete_after=5  # 5秒后自动删除提醒
             )
             logger.info(f"✅ 删除提醒 Embed 已发送")
+        except Exception as e:
+            logger.warning(f"⚠️ 无法发送删除提醒 Embed: {e}")
     
     except Forbidden:
         error_msg = (
