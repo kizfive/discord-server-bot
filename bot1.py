@@ -58,7 +58,20 @@ try:
 except (ValueError, TypeError):
     CHANNEL_IDS = set()
 
+# 日志接收用户 ID（用于私聊发送操作日志）
+LOG_USER_ID = None
+try:
+    log_user = os.getenv('DISCORD_LOG_USER_ID', '')
+    if log_user and log_user.strip():
+        LOG_USER_ID = int(log_user.strip())
+except (ValueError, TypeError):
+    LOG_USER_ID = None
+
 logger.info(f'监听的频道 ID 列表: {CHANNEL_IDS if CHANNEL_IDS else "所有频道"}')
+if LOG_USER_ID:
+    logger.info(f'日志将私聊发送至用户 ID: {LOG_USER_ID}')
+else:
+    logger.info('未配置日志接收用户，仅保存本地日志文件')
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -132,6 +145,60 @@ def log_message_info(message: discord.Message, has_link: bool, reason: str = Non
     logger.info(log_msg)
 
 
+async def send_dm_log(message: discord.Message, action: str, result: str):
+    """发送删除操作日志到指定用户的 DM"""
+    if not LOG_USER_ID:
+        return
+    
+    try:
+        log_user = await client.fetch_user(LOG_USER_ID)
+        
+        embed = discord.Embed(
+            title="🚨 消息删除日志",
+            color=discord.Color.red(),
+            timestamp=datetime.now()
+        )
+        
+        embed.add_field(
+            name="👤 违规用户",
+            value=f"{message.author.mention}\n{message.author.name}#{message.author.discriminator}\nID: {message.author.id}",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📍 位置",
+            value=f"服务器: {message.guild.name}\n频道: #{message.channel.name}\n频道ID: {message.channel.id}",
+            inline=False
+        )
+        
+        content_preview = (message.content[:200] + '...') if len(message.content) > 200 else message.content
+        embed.add_field(
+            name="💬 原消息内容",
+            value=f"```\n{content_preview}\n```" if content_preview else "（空消息）",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔧 执行的操作",
+            value=action,
+            inline=False
+        )
+        
+        embed.add_field(
+            name="✅ 操作结果",
+            value=result,
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Zeabur Discord Bot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        await log_user.send(embed=embed)
+        logger.info(f"✅ 日志已私聊发送至用户 ID {LOG_USER_ID}")
+        
+    except Exception as e:
+        logger.error(f"❌ 无法发送日志 DM: {e}")
+
+
 @client.event
 async def on_ready():
     logger.info(f"✅ Bot 已登录: {client.user} (ID: {client.user.id})")
@@ -176,6 +243,9 @@ async def on_message(message: discord.Message):
         await message.delete()
         logger.info(f"✅ 操作成功：消息已删除")
         
+        # 发送删除操作日志到指定用户
+        await send_dm_log(message, "删除无链接消息", "✅ 消息已成功删除")
+        
         # 发送临时提示消息（5秒后自动删除）
         try:
             tip = await message.channel.send(
@@ -198,9 +268,11 @@ async def on_message(message: discord.Message):
             f"  请确保 Bot 在该频道有 '删除消息' 权限"
         )
         logger.error(error_msg)
+        await send_dm_log(message, "尝试删除无链接消息", f"❌ 失败 - Bot 缺少删除消息权限")
     except HTTPException as e:
         error_msg = f"❌ 操作失败：HTTP 错误 - {str(e)}"
         logger.error(error_msg)
+        await send_dm_log(message, "尝试删除无链接消息", f"❌ 失败 - HTTP 错误: {str(e)}")
 
 
 if __name__ == '__main__':
@@ -211,14 +283,17 @@ if __name__ == '__main__':
             '  PowerShell:\n'
             '    $env:DISCORD_TOKEN="your_bot_token"\n'
             '    $env:DISCORD_CHANNEL_ID="123456789,987654321"  # 逗号分隔多频道，或留空监听所有\n'
+            '    $env:DISCORD_LOG_USER_ID="用户ID"  # 可选：指定接收删除日志的用户\n'
             '    python .\\bot1.py\n'
             '\n  CMD:\n'
             '    set DISCORD_TOKEN=your_bot_token\n'
             '    set DISCORD_CHANNEL_ID=123456789,987654321\n'
+            '    set DISCORD_LOG_USER_ID=用户ID\n'
             '    python bot1.py\n'
             '\n  Linux/Mac:\n'
             '    export DISCORD_TOKEN="your_bot_token"\n'
             '    export DISCORD_CHANNEL_ID="123456789,987654321"\n'
+            '    export DISCORD_LOG_USER_ID="用户ID"\n'
             '    python bot1.py'
         )
         print(error_msg)
