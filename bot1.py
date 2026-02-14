@@ -6,7 +6,7 @@ from discord import Forbidden, HTTPException
 import aiohttp
 import socket
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- 日志系统配置 ---
 def setup_logging():
@@ -93,6 +93,57 @@ try:
             pass
 except Exception:
     _aiohttp_session = None
+
+
+# --- 用户豁免期管理（60秒内允许发送任何内容） ---
+user_exemptions = {}  # {user_id: {"expires_at": datetime, "channel_ids": set()}}
+
+def is_user_exempt(user_id: int, channel_id: int) -> bool:
+    """检查用户是否在豁免期内"""
+    if user_id not in user_exemptions:
+        return False
+    
+    exemption = user_exemptions[user_id]
+    
+    # 检查是否过期
+    if datetime.now() > exemption["expires_at"]:
+        del user_exemptions[user_id]
+        return False
+    
+    # 检查是否在该频道有豁免
+    return channel_id in exemption["channel_ids"]
+
+def grant_exemption(user_id: int, channel_id: int, duration_seconds: int = 60):
+    """授予用户豁免期（在指定频道内可以发送任何内容）"""
+    expires_at = datetime.now() + timedelta(seconds=duration_seconds)
+    
+    if user_id not in user_exemptions:
+        user_exemptions[user_id] = {
+            "expires_at": expires_at,
+            "channel_ids": set()
+        }
+    else:
+        # 更新过期时间为更晚的时间
+        user_exemptions[user_id]["expires_at"] = max(
+            user_exemptions[user_id]["expires_at"],
+            expires_at
+        )
+    
+    # 添加频道
+    user_exemptions[user_id]["channel_ids"].add(channel_id)
+    logger.info(f"✅ 授予用户 {user_id} 在频道 {channel_id} 60秒的豁免期")
+
+def cleanup_expired_exemptions():
+    """清理过期的豁免期"""
+    now = datetime.now()
+    expired_users = [
+        uid for uid, data in user_exemptions.items()
+        if now > data["expires_at"]
+    ]
+    for uid in expired_users:
+        del user_exemptions[uid]
+    if expired_users:
+        logger.debug(f"🧹 清理了 {len(expired_users)} 个过期的豁免期")
 
 
 def message_has_link(message: discord.Message) -> bool:
@@ -208,6 +259,9 @@ async def on_ready():
 async def on_message(message: discord.Message):
     """监听消息事件：检测是否含有链接，没有则删除并发送短暂提示"""
     
+    # 清理过期的豁免期
+    cleanup_expired_exemptions()
+    
     # 跳过 Bot 消息
     if message.author.bot:
         return
@@ -225,14 +279,24 @@ async def on_message(message: discord.Message):
          message.author.guild_permissions.manage_messages)
     )
     
+    # 检查用户是否在豁免期内
+    is_exempt = is_user_exempt(message.author.id, message.channel.id)
+    
     # 记录包含链接的消息（直接通过）
     if has_link:
         log_message_info(message, True, "✅ 已通过 - 消息包含有效链接")
+        # 授予发送者 60 秒豁免期，允许发送任何内容
+        grant_exemption(message.author.id, message.channel.id, duration_seconds=60)
         return
     
     # 记录不含链接但是管理员的消息（直接通过）
     if is_admin:
         log_message_info(message, False, "✅ 已通过 - 发送者为管理员/版主（豁免规则）")
+        return
+    
+    # 如果用户在豁免期内，允许发送任何内容（包括纯文本、图片等）
+    if is_exempt:
+        log_message_info(message, False, f"✅ 已通过 - 发送者在豁免期内")
         return
     
     # 需要删除的消息
@@ -261,7 +325,7 @@ async def on_message(message: discord.Message):
             )
             # reminder_embed.add_field(
             #     name="✅ 解决办法",
-            #     value="发送一条**包含链接的消息**后，你将获得40秒的豁免期，期间可以发送任何内容（包括纯图片）。",
+            #     value="发送一条**包含链接的消息**后，你将获得60秒的豁免期，期间可以发送任何内容（包括纯图片）。",
             #    inline=False
             # )
             reminder_embed.set_footer(text="此提醒将在5秒后自动删除")
