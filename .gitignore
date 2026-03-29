@@ -3,6 +3,7 @@
 .env.local
 .env.*.local
 config.py
+local_config.py
 
 # Python
 __pycache__/

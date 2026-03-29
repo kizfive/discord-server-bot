@@ -6,6 +6,35 @@
 - ✅ 无链接消息自动删除并发送提示
 - ✅ 管理员/版主消息豁免（不会被删除）
 - ✅ **详细日志记录**（保存至本地文件）
+- ✅ 每条被监听消息都会上报审计结果（通过/豁免/撤回/失败）
+- ✅ 支持 `local_config.py` 本地私密配置（避免上传敏感信息）
+- ✅ 每日定时播报运行状态与撤回统计（频道或私聊）
+- ✅ 撤回日志完整展示文本与图片附件（不再只显示“[图片]”）
+- ✅ 支持私聊 `/ping` 命令检测在线与延迟
+
+## 隐私配置（推荐）
+
+项目已支持读取 `local_config.py`，并且该文件已加入 Git 忽略，不会提交到仓库。
+
+1. 复制样例文件：
+```powershell
+Copy-Item .\local_config.example.py .\local_config.py
+```
+
+2. 编辑 `local_config.py`，填写：
+- `DISCORD_TOKEN`
+- `DISCORD_CHANNEL_ID`（可选，多频道用逗号分隔）
+- `DISCORD_LOG_USER_ID`（可选）
+- `DISCORD_REPORT_CHANNEL_ID` / `DISCORD_REPORT_USER_ID`（可选，日报目标）
+- `DISCORD_REPORT_TIME`（可选，格式 HH:MM）
+
+3. 运行：
+```powershell
+python .\bot1.py
+```
+
+说明：
+- `bot1.py` 会优先读取 `local_config.py`；若未配置，再读取环境变量。
 
 ## 新增功能详解
 
@@ -70,6 +99,41 @@ $env:DISCORD_LOG_USER_ID="你的用户ID"
 python .\bot1.py
 ```
 
+说明：
+- 只要消息进入监听范围，Bot 都会向 `DISCORD_LOG_USER_ID` 上报审计结果。
+- 上报类型包括：
+   - 用户发送了包含链接的消息，已通过并授予豁免期
+   - 用户发送了不含链接消息，但为管理员，直接通过
+   - 用户发送了不含链接消息，但处于豁免期，直接通过
+   - 用户发送了不含链接消息，已撤回（并附完整原文/附件/图片预览）
+
+### 启用每日定时播报
+
+可播报到频道或私聊（也可以同时设置）：
+
+```powershell
+$env:DISCORD_TOKEN="your_bot_token_here"
+$env:DISCORD_REPORT_CHANNEL_ID="123456789012345678"
+$env:DISCORD_REPORT_TIME="09:00"
+python .\bot1.py
+```
+
+或播报到私聊：
+
+```powershell
+$env:DISCORD_TOKEN="your_bot_token_here"
+$env:DISCORD_REPORT_USER_ID="123456789012345678"
+$env:DISCORD_REPORT_TIME="09:00"
+python .\bot1.py
+```
+
+### 私聊命令：/ping
+
+在 Discord 中私聊 Bot，输入 `/ping`，Bot 会返回：
+- `pong!`
+- 网关延迟（ms）
+- 命令响应耗时（ms）
+
 ### 监听所有频道
 ```powershell
 $env:DISCORD_TOKEN="your_bot_token_here"
@@ -133,7 +197,9 @@ python .\bot1.py
 **内容包括**：
 - 👤 违规用户（用户名、ID、头像）
 - 📍 位置（服务器名、频道名、频道ID）
-- 💬 原消息内容（前200字符）
+- 💬 原消息内容（完整文本，自动分片发送）
+- 📎 原附件列表（文件名 + URL）
+- 🖼️ 图片附件可视化预览（直接显示图片）
 - 🔧 执行的操作（删除原因）
 - ✅ 操作结果（成功/失败及失败原因）
 - ⏰ 操作时间戳
@@ -150,10 +216,13 @@ python .\bot1.py
 | 多频道不生效 | 确认逗号分隔的频道 ID 格式正确 |
 | 无法接收私聊日志 | 检查 `DISCORD_LOG_USER_ID` 是否正确，确保该用户允许 Bot 私聊 |
 | 私聊日志发送失败 | 检查隐私设置：用户设置 → 隐私与安全 → 允许来自服务器成员的私聊 |
+| `Duplicate 'Server' header found` 连接失败 | 通常是本地网络代理/中间层导致；默认已关闭自定义代理读取。若仍失败，关闭代理软件后重试，或切换网络；仅在需要时再启用 `DISCORD_FORCE_IPV4` / `DISCORD_TRUST_ENV_PROXY` |
 
 ## 文件说明
 
 - `bot1.py` - 主脚本（含日志和多频道支持）
+- `local_config.py` - 本地私密配置（已忽略提交）
+- `local_config.example.py` - 配置样例（可提交）
 - `logs/` - 日志文件目录（自动创建）
 - `.gitignore` - Git 忽略规则
 - `requirements.txt` - Python 依赖

@@ -3,10 +3,16 @@ import re
 import logging
 import discord
 from discord import Forbidden, HTTPException
+from discord import app_commands
 import aiohttp
 import socket
 import asyncio
 from datetime import datetime, timedelta
+
+try:
+    import local_config
+except Exception:
+    local_config = None
 
 # --- 日志系统配置 ---
 def setup_logging():
@@ -41,37 +47,119 @@ def setup_logging():
 
 logger = setup_logging()
 
+
+def get_config_value(key: str, default=None):
+    """优先读取 local_config.py，其次读取环境变量。"""
+    if local_config is not None and hasattr(local_config, key):
+        return getattr(local_config, key)
+    return os.getenv(key, default)
+
+
+def parse_int(value, default=None):
+    """将配置值安全转换为整数。"""
+    try:
+        if value is None:
+            return default
+        value_str = str(value).strip()
+        if not value_str:
+            return default
+        return int(value_str)
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_channel_ids(value) -> set:
+    """解析逗号分隔的频道 ID。"""
+    channel_ids = set()
+    if value is None:
+        return channel_ids
+    for ch_id in str(value).split(','):
+        parsed = parse_int(ch_id, default=None)
+        if parsed and parsed != 0:
+            channel_ids.add(parsed)
+    return channel_ids
+
+
+def parse_report_time(value: str) -> tuple:
+    """解析每日播报时间，格式 HH:MM。"""
+    default_hour, default_minute = 9, 0
+    try:
+        raw = str(value).strip()
+        match = re.match(r'^(\d{1,2}):(\d{1,2})$', raw)
+        if not match:
+            return default_hour, default_minute
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except Exception:
+        pass
+    return default_hour, default_minute
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    """解析布尔配置。"""
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if normalized in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    return default
+
+
+def chunk_text(text: str, max_len: int = 1800) -> list:
+    """按固定长度切分字符串，避免超过 Discord 消息长度限制。"""
+    if not text:
+        return []
+    return [text[i:i + max_len] for i in range(0, len(text), max_len)]
+
+
+def is_image_attachment(attachment: discord.Attachment) -> bool:
+    """判断附件是否为图片。"""
+    content_type = (attachment.content_type or '').lower()
+    if content_type.startswith('image/'):
+        return True
+    filename = (attachment.filename or '').lower()
+    return filename.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))
+
 # --- URL 检测正则表达式 ---
 URL_PATTERN = re.compile(r'https?://|www\.', re.IGNORECASE)
 
 # --- 从环境变量读取配置（启动时必须设置）---
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN = get_config_value('DISCORD_TOKEN')
 
 # 支持多频道：用逗号分隔，如 "123456789,987654321,555666777"
-CHANNEL_IDS_STR = os.getenv('DISCORD_CHANNEL_ID', '0')
-CHANNEL_IDS = set()
-try:
-    for ch_id in CHANNEL_IDS_STR.split(','):
-        ch_id = ch_id.strip()
-        if ch_id and ch_id != '0':
-            CHANNEL_IDS.add(int(ch_id))
-except (ValueError, TypeError):
-    CHANNEL_IDS = set()
+CHANNEL_IDS_STR = get_config_value('DISCORD_CHANNEL_ID', '0')
+CHANNEL_IDS = parse_channel_ids(CHANNEL_IDS_STR)
 
 # 日志接收用户 ID（用于私聊发送操作日志）
-LOG_USER_ID = None
-try:
-    log_user = os.getenv('DISCORD_LOG_USER_ID', '')
-    if log_user and log_user.strip():
-        LOG_USER_ID = int(log_user.strip())
-except (ValueError, TypeError):
-    LOG_USER_ID = None
+LOG_USER_ID = parse_int(get_config_value('DISCORD_LOG_USER_ID', ''), default=None)
+
+# 每日播报配置：可指定频道或用户（二选一也可同时设置）
+REPORT_CHANNEL_ID = parse_int(get_config_value('DISCORD_REPORT_CHANNEL_ID', ''), default=None)
+REPORT_USER_ID = parse_int(get_config_value('DISCORD_REPORT_USER_ID', ''), default=None)
+REPORT_TIME_RAW = str(get_config_value('DISCORD_REPORT_TIME', '09:00'))
+REPORT_HOUR, REPORT_MINUTE = parse_report_time(REPORT_TIME_RAW)
+FORCE_IPV4 = parse_bool(get_config_value('DISCORD_FORCE_IPV4', '0'), default=False)
+TRUST_ENV_PROXY = parse_bool(get_config_value('DISCORD_TRUST_ENV_PROXY', '0'), default=False)
 
 logger.info(f'监听的频道 ID 列表: {CHANNEL_IDS if CHANNEL_IDS else "所有频道"}')
 if LOG_USER_ID:
     logger.info(f'日志将私聊发送至用户 ID: {LOG_USER_ID}')
 else:
     logger.info('未配置日志接收用户，仅保存本地日志文件')
+if REPORT_CHANNEL_ID or REPORT_USER_ID:
+    logger.info(
+        f'每日播报已启用: 时间={REPORT_HOUR:02d}:{REPORT_MINUTE:02d}, '
+        f'频道ID={REPORT_CHANNEL_ID}, 用户ID={REPORT_USER_ID}'
+    )
+else:
+    logger.info('未配置每日播报目标（DISCORD_REPORT_CHANNEL_ID / DISCORD_REPORT_USER_ID）')
+logger.info(
+    f'aiohttp 连接模式: FORCE_IPV4={FORCE_IPV4}, TRUST_ENV_PROXY={TRUST_ENV_PROXY}'
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -79,20 +167,42 @@ intents.messages = True
 intents.guilds = True
 
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-# 强制使用 IPv4，避免 Windows 在 IPv6 上发生连接超时；启用 trust_env 以读取代理环境变量
-try:
-    connector = aiohttp.TCPConnector(family=socket.AF_INET)
-    _aiohttp_session = aiohttp.ClientSession(trust_env=True, connector=connector)
+startup_time = datetime.now()
+daily_stats = {
+    'date': datetime.now().date(),
+    'checked': 0,
+    'deleted': 0,
+    'allowed_link': 0,
+    'allowed_admin': 0,
+    'allowed_exempt': 0,
+    'errors': 0,
+    'exemption_granted': 0,
+}
+total_deleted = 0
+daily_report_task = None
+slash_command_synced = False
+EXEMPTION_SECONDS = 60
+
+# 可选：自定义 aiohttp 会话。
+# 默认关闭，避免在某些本地代理/中间层网络环境下触发 websocket 握手异常。
+_aiohttp_session = None
+if FORCE_IPV4 or TRUST_ENV_PROXY:
     try:
-        client.http.session = _aiohttp_session
-    except Exception:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET) if FORCE_IPV4 else None
+        _aiohttp_session = aiohttp.ClientSession(trust_env=TRUST_ENV_PROXY, connector=connector)
         try:
-            client.http._session = _aiohttp_session
+            client.http.session = _aiohttp_session
         except Exception:
-            pass
-except Exception:
-    _aiohttp_session = None
+            try:
+                client.http._session = _aiohttp_session
+            except Exception:
+                pass
+        logger.info('✅ 已启用自定义 aiohttp 会话')
+    except Exception as e:
+        logger.warning(f'⚠️ 初始化自定义 aiohttp 会话失败，将使用 discord.py 默认会话: {e}')
+        _aiohttp_session = None
 
 
 # --- 用户豁免期管理（60秒内允许发送任何内容） ---
@@ -146,6 +256,123 @@ def cleanup_expired_exemptions():
         logger.debug(f"🧹 清理了 {len(expired_users)} 个过期的豁免期")
 
 
+def get_exemption_remaining_seconds(user_id: int, channel_id: int) -> int:
+    """返回用户在频道中的剩余豁免秒数。"""
+    exemption = user_exemptions.get(user_id)
+    if not exemption:
+        return 0
+    if channel_id not in exemption.get("channel_ids", set()):
+        return 0
+    remaining = int((exemption["expires_at"] - datetime.now()).total_seconds())
+    return max(remaining, 0)
+
+
+def ensure_daily_stats_date():
+    """跨天时重置当日统计。"""
+    today = datetime.now().date()
+    if daily_stats['date'] == today:
+        return
+    daily_stats.update({
+        'date': today,
+        'checked': 0,
+        'deleted': 0,
+        'allowed_link': 0,
+        'allowed_admin': 0,
+        'allowed_exempt': 0,
+        'errors': 0,
+        'exemption_granted': 0,
+    })
+
+
+def get_next_report_time(now: datetime = None) -> datetime:
+    """计算下一次日报发送时间（本地时区）。"""
+    current = now or datetime.now()
+    next_run = current.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+    if next_run <= current:
+        next_run += timedelta(days=1)
+    return next_run
+
+
+async def send_daily_report(reason: str = '定时播报'):
+    """发送每日状态报告到指定频道或私聊。"""
+    if not REPORT_CHANNEL_ID and not REPORT_USER_ID:
+        return
+
+    ensure_daily_stats_date()
+
+    target = None
+    target_name = 'Unknown'
+
+    if REPORT_CHANNEL_ID:
+        target = client.get_channel(REPORT_CHANNEL_ID)
+        if target is None:
+            try:
+                target = await client.fetch_channel(REPORT_CHANNEL_ID)
+            except Exception as e:
+                logger.warning(f'⚠️ 无法获取日报频道 {REPORT_CHANNEL_ID}: {e}')
+        if target is not None:
+            target_name = f'频道 #{getattr(target, "name", REPORT_CHANNEL_ID)}'
+
+    if target is None and REPORT_USER_ID:
+        try:
+            target = await client.fetch_user(REPORT_USER_ID)
+            target_name = f'用户 {REPORT_USER_ID} 私聊'
+        except Exception as e:
+            logger.warning(f'⚠️ 无法获取日报用户 {REPORT_USER_ID}: {e}')
+
+    if target is None:
+        logger.warning('⚠️ 日报目标无效，跳过本次播报')
+        return
+
+    uptime = datetime.now() - startup_time
+    status_text = '✅ 正常运行' if client.is_ready() else '❌ 异常'
+
+    embed = discord.Embed(
+        title='📊 Discord 频道守护日报',
+        description=f'触发方式: {reason}',
+        color=discord.Color.blue(),
+        timestamp=datetime.now()
+    )
+    embed.add_field(name='🤖 运行状态', value=status_text, inline=False)
+    embed.add_field(name='⏱️ 运行时长', value=str(uptime).split('.')[0], inline=True)
+    embed.add_field(name='📅 统计日期', value=str(daily_stats['date']), inline=True)
+    embed.add_field(name='👀 当日检查消息数', value=str(daily_stats['checked']), inline=True)
+    embed.add_field(name='🗑️ 当日撤回消息数', value=str(daily_stats['deleted']), inline=True)
+    embed.add_field(name='✅ 含链接通过', value=str(daily_stats['allowed_link']), inline=True)
+    embed.add_field(name='🛡️ 管理员豁免通过', value=str(daily_stats['allowed_admin']), inline=True)
+    embed.add_field(name='⏳ 豁免期通过', value=str(daily_stats['allowed_exempt']), inline=True)
+    embed.add_field(name='🎟️ 当日发放豁免次数', value=str(daily_stats['exemption_granted']), inline=True)
+    embed.add_field(name='⚠️ 当日错误次数', value=str(daily_stats['errors']), inline=True)
+    embed.add_field(name='📦 累计撤回总数', value=str(total_deleted), inline=True)
+    embed.set_footer(text='discord-link-moderator')
+
+    await target.send(embed=embed)
+    logger.info(f'✅ 日报已发送到 {target_name}')
+
+
+async def daily_report_loop():
+    """后台循环：每天在指定时间发送状态报告。"""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        if not REPORT_CHANNEL_ID and not REPORT_USER_ID:
+            await asyncio.sleep(300)
+            continue
+
+        next_run = get_next_report_time()
+        seconds_to_wait = max((next_run - datetime.now()).total_seconds(), 1)
+        logger.info(
+            f'⏰ 下次日报时间: {next_run.strftime("%Y-%m-%d %H:%M:%S")} '
+            f'(约 {int(seconds_to_wait)} 秒后)'
+        )
+        await asyncio.sleep(seconds_to_wait)
+
+        try:
+            await send_daily_report(reason='每日定时')
+        except Exception as e:
+            daily_stats['errors'] += 1
+            logger.error(f'❌ 日报发送失败: {e}')
+
+
 def message_has_link(message: discord.Message) -> bool:
     """检查消息是否包含链接：仅通过文本内的 URL 判断（不包括纯附件）"""
     # 只检查文本内容中的 URL
@@ -197,15 +424,18 @@ def log_message_info(message: discord.Message, has_link: bool, reason: str = Non
 
 
 async def send_dm_log(message: discord.Message, action: str, result: str):
-    """发送删除操作日志到指定用户的 DM"""
+    """发送消息审计日志到指定用户的 DM。"""
     if not LOG_USER_ID:
         return
     
     try:
         log_user = await client.fetch_user(LOG_USER_ID)
         
+        has_link = message_has_link(message)
+        content_preview = (message.content[:200] + '...') if len(message.content) > 200 else (message.content or '（空消息）')
+
         embed = discord.Embed(
-            title="🚨 消息删除日志",
+            title="📡 消息审计上报",
             color=discord.Color.red(),
             timestamp=datetime.now()
         )
@@ -216,18 +446,27 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
             inline=False
         )
         
+        guild_name = getattr(message.guild, 'name', 'Direct Message')
+        channel_name = getattr(message.channel, 'name', 'DM')
         embed.add_field(
             name="📍 位置",
-            value=f"服务器: {message.guild.name}\n频道: #{message.channel.name}\n频道ID: {message.channel.id}",
+            value=f"服务器: {guild_name}\n频道: #{channel_name}\n频道ID: {message.channel.id}",
+            inline=False
+        )
+
+        embed.add_field(
+            name="🔎 链接检测",
+            value="包含链接" if has_link else "不包含链接",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🧾 内容预览",
+            value=content_preview,
             inline=False
         )
         
-        content_preview = (message.content[:200] + '...') if len(message.content) > 200 else message.content
-        embed.add_field(
-            name="💬 原消息内容",
-            value=f"```\n{content_preview}\n```" if content_preview else "（空消息）",
-            inline=False
-        )
+        embed.add_field(name="🔗 原消息链接", value=message.jump_url, inline=False)
         
         embed.add_field(
             name="🔧 执行的操作",
@@ -244,15 +483,79 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
         embed.set_footer(text=f"Zeabur Discord Bot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         await log_user.send(embed=embed)
+
+        # 对删除类操作发送完整内容和附件
+        if ('撤回' in action) or ('删除' in action):
+            if message.content:
+                text_chunks = chunk_text(message.content, max_len=1800)
+                total_chunks = len(text_chunks)
+                for idx, chunk in enumerate(text_chunks, 1):
+                    await log_user.send(f"📝 原消息文本 ({idx}/{total_chunks})\n```\n{chunk}\n```")
+            else:
+                await log_user.send("📝 原消息文本： （空消息）")
+
+            if message.attachments:
+                attachment_lines = []
+                for index, attachment in enumerate(message.attachments, 1):
+                    attachment_lines.append(
+                        f"{index}. {attachment.filename} | {attachment.size} bytes | {attachment.url}"
+                    )
+
+                for chunk in chunk_text('\n'.join(attachment_lines), max_len=1800):
+                    await log_user.send(f"📎 原消息附件列表\n```\n{chunk}\n```")
+
+                for attachment in message.attachments:
+                    if is_image_attachment(attachment):
+                        image_embed = discord.Embed(
+                            title=f"🖼️ 图片附件: {attachment.filename}",
+                            color=discord.Color.orange(),
+                            timestamp=datetime.now()
+                        )
+                        image_embed.set_image(url=attachment.url)
+                        await log_user.send(embed=image_embed)
+
         logger.info(f"✅ 日志已私聊发送至用户 ID {LOG_USER_ID}")
         
     except Exception as e:
         logger.error(f"❌ 无法发送日志 DM: {e}")
 
 
+@tree.command(name='ping', description='检查机器人运行状态与延迟')
+async def ping_command(interaction: discord.Interaction):
+    """私聊命令：/ping -> pong + 延迟。"""
+    if interaction.guild is not None:
+        await interaction.response.send_message('请在私聊中使用 /ping。', ephemeral=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    await interaction.response.send_message('pong! 正在计算延迟...')
+
+    response_ms = (loop.time() - start) * 1000
+    gateway_ms = client.latency * 1000 if client.latency is not None else -1
+
+    await interaction.edit_original_response(
+        content=f'pong! 网关延迟: {gateway_ms:.1f}ms | 响应耗时: {response_ms:.1f}ms'
+    )
+
+
 @client.event
 async def on_ready():
+    global daily_report_task, slash_command_synced
     logger.info(f"✅ Bot 已登录: {client.user} (ID: {client.user.id})")
+
+    if not slash_command_synced:
+        try:
+            synced = await tree.sync()
+            slash_command_synced = True
+            logger.info(f"✅ 已同步斜杠命令数量: {len(synced)}")
+        except Exception as e:
+            logger.error(f"❌ 同步斜杠命令失败: {e}")
+
+    if daily_report_task is None or daily_report_task.done():
+        daily_report_task = asyncio.create_task(daily_report_loop())
+        logger.info('✅ 每日播报任务已启动')
 
 
 @client.event
@@ -269,6 +572,9 @@ async def on_message(message: discord.Message):
     # 检查是否监听此频道
     if CHANNEL_IDS and message.channel.id not in CHANNEL_IDS:
         return
+
+    ensure_daily_stats_date()
+    daily_stats['checked'] += 1
     
     has_link = message_has_link(message)
     
@@ -286,29 +592,56 @@ async def on_message(message: discord.Message):
     if has_link:
         log_message_info(message, True, "✅ 已通过 - 消息包含有效链接")
         # 授予发送者 60 秒豁免期，允许发送任何内容
-        grant_exemption(message.author.id, message.channel.id, duration_seconds=60)
+        grant_exemption(message.author.id, message.channel.id, duration_seconds=EXEMPTION_SECONDS)
+        daily_stats['allowed_link'] += 1
+        daily_stats['exemption_granted'] += 1
+        await send_dm_log(
+            message,
+            "用户发送消息，包含链接，给予通过并授予豁免期",
+            f"✅ 已通过，并获得 {EXEMPTION_SECONDS} 秒豁免期"
+        )
         return
     
     # 记录不含链接但是管理员的消息（直接通过）
     if is_admin:
         log_message_info(message, False, "✅ 已通过 - 发送者为管理员/版主（豁免规则）")
+        daily_stats['allowed_admin'] += 1
+        await send_dm_log(
+            message,
+            "用户发送消息，不包含链接，发送者为管理员，不进行检测",
+            "✅ 已通过（管理员/版主豁免）"
+        )
         return
     
     # 如果用户在豁免期内，允许发送任何内容（包括纯文本、图片等）
     if is_exempt:
+        remaining_seconds = get_exemption_remaining_seconds(message.author.id, message.channel.id)
         log_message_info(message, False, f"✅ 已通过 - 发送者在豁免期内")
+        daily_stats['allowed_exempt'] += 1
+        await send_dm_log(
+            message,
+            "用户发送消息，不包含链接，但处于豁免期",
+            f"✅ 已通过（剩余豁免约 {remaining_seconds} 秒）"
+        )
         return
     
     # 需要删除的消息
     log_message_info(message, False, "⏳ 正在删除无链接消息...")
     
     try:
+        global total_deleted
         # 删除无链接消息
         await message.delete()
         logger.info(f"✅ 操作成功：消息已删除")
+        daily_stats['deleted'] += 1
+        total_deleted += 1
         
         # 发送删除操作日志到指定用户
-        await send_dm_log(message, "删除无链接消息", "✅ 消息已成功删除")
+        await send_dm_log(
+            message,
+            "用户发送消息，不包含链接，已撤回消息并附带原消息内容",
+            "✅ 消息已成功撤回"
+        )
         
         # 在频道中发送删除提醒 Embed（仅用户短时间内可见）
         try:
@@ -341,6 +674,7 @@ async def on_message(message: discord.Message):
             logger.warning(f"⚠️ 无法发送删除提醒 Embed: {e}")
     
     except Forbidden:
+        daily_stats['errors'] += 1
         error_msg = (
             f"❌ 操作失败：Bot 缺少删除消息权限\n"
             f"  频道 ID: {message.channel.id}\n"
@@ -348,32 +682,50 @@ async def on_message(message: discord.Message):
             f"  请确保 Bot 在该频道有 '删除消息' 权限"
         )
         logger.error(error_msg)
-        await send_dm_log(message, "尝试删除无链接消息", f"❌ 失败 - Bot 缺少删除消息权限")
+        await send_dm_log(
+            message,
+            "用户发送消息，不包含链接，尝试撤回消息",
+            "❌ 撤回失败 - Bot 缺少删除消息权限"
+        )
     except HTTPException as e:
+        daily_stats['errors'] += 1
         error_msg = f"❌ 操作失败：HTTP 错误 - {str(e)}"
         logger.error(error_msg)
-        await send_dm_log(message, "尝试删除无链接消息", f"❌ 失败 - HTTP 错误: {str(e)}")
+        await send_dm_log(
+            message,
+            "用户发送消息，不包含链接，尝试撤回消息",
+            f"❌ 撤回失败 - HTTP 错误: {str(e)}"
+        )
 
 
 if __name__ == '__main__':
     if not TOKEN:
         error_msg = (
-            '❌ 错误：DISCORD_TOKEN 环境变量未设置\n'
+            '❌ 错误：未设置 DISCORD_TOKEN（可在 local_config.py 或环境变量中配置）\n'
             '\n使用方法（支持多频道）：\n'
             '  PowerShell:\n'
             '    $env:DISCORD_TOKEN="your_bot_token"\n'
             '    $env:DISCORD_CHANNEL_ID="123456789,987654321"  # 逗号分隔多频道，或留空监听所有\n'
             '    $env:DISCORD_LOG_USER_ID="用户ID"  # 可选：指定接收删除日志的用户\n'
+            '    $env:DISCORD_REPORT_CHANNEL_ID="频道ID"  # 可选：日报接收频道\n'
+            '    $env:DISCORD_REPORT_USER_ID="用户ID"  # 可选：日报接收私聊用户\n'
+            '    $env:DISCORD_REPORT_TIME="09:00"  # 可选：每日播报时间（HH:MM）\n'
             '    python .\\bot1.py\n'
             '\n  CMD:\n'
             '    set DISCORD_TOKEN=your_bot_token\n'
             '    set DISCORD_CHANNEL_ID=123456789,987654321\n'
             '    set DISCORD_LOG_USER_ID=用户ID\n'
+            '    set DISCORD_REPORT_CHANNEL_ID=频道ID\n'
+            '    set DISCORD_REPORT_USER_ID=用户ID\n'
+            '    set DISCORD_REPORT_TIME=09:00\n'
             '    python bot1.py\n'
             '\n  Linux/Mac:\n'
             '    export DISCORD_TOKEN="your_bot_token"\n'
             '    export DISCORD_CHANNEL_ID="123456789,987654321"\n'
             '    export DISCORD_LOG_USER_ID="用户ID"\n'
+            '    export DISCORD_REPORT_CHANNEL_ID="频道ID"\n'
+            '    export DISCORD_REPORT_USER_ID="用户ID"\n'
+            '    export DISCORD_REPORT_TIME="09:00"\n'
             '    python bot1.py'
         )
         print(error_msg)
