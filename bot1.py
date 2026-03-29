@@ -142,8 +142,7 @@ REPORT_CHANNEL_ID = parse_int(get_config_value('DISCORD_REPORT_CHANNEL_ID', ''),
 REPORT_USER_ID = parse_int(get_config_value('DISCORD_REPORT_USER_ID', ''), default=None)
 REPORT_TIME_RAW = str(get_config_value('DISCORD_REPORT_TIME', '09:00'))
 REPORT_HOUR, REPORT_MINUTE = parse_report_time(REPORT_TIME_RAW)
-FORCE_IPV4 = parse_bool(get_config_value('DISCORD_FORCE_IPV4', '0'), default=False)
-TRUST_ENV_PROXY = parse_bool(get_config_value('DISCORD_TRUST_ENV_PROXY', '0'), default=False)
+DISCORD_PROXY = get_config_value('DISCORD_PROXY', None)
 
 logger.info(f'监听的频道 ID 列表: {CHANNEL_IDS if CHANNEL_IDS else "所有频道"}')
 if LOG_USER_ID:
@@ -157,16 +156,18 @@ if REPORT_CHANNEL_ID or REPORT_USER_ID:
     )
 else:
     logger.info('未配置每日播报目标（DISCORD_REPORT_CHANNEL_ID / DISCORD_REPORT_USER_ID）')
-logger.info(
-    f'aiohttp 连接模式: FORCE_IPV4={FORCE_IPV4}, TRUST_ENV_PROXY={TRUST_ENV_PROXY}'
-)
+
+if DISCORD_PROXY:
+    logger.info(f'已配置 Discord API 与 WebSocket 代理: {DISCORD_PROXY}')
+else:
+    logger.info('未配置代理，将使用直连')
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
 
-client = discord.Client(intents=intents)
+client = discord.Client(intents=intents, proxy=DISCORD_PROXY)
 tree = app_commands.CommandTree(client)
 
 startup_time = datetime.now()
@@ -184,25 +185,6 @@ total_deleted = 0
 daily_report_task = None
 slash_command_synced = False
 EXEMPTION_SECONDS = 60
-
-# 可选：自定义 aiohttp 会话。
-# 默认关闭，避免在某些本地代理/中间层网络环境下触发 websocket 握手异常。
-_aiohttp_session = None
-if FORCE_IPV4 or TRUST_ENV_PROXY:
-    try:
-        connector = aiohttp.TCPConnector(family=socket.AF_INET) if FORCE_IPV4 else None
-        _aiohttp_session = aiohttp.ClientSession(trust_env=TRUST_ENV_PROXY, connector=connector)
-        try:
-            client.http.session = _aiohttp_session
-        except Exception:
-            try:
-                client.http._session = _aiohttp_session
-            except Exception:
-                pass
-        logger.info('✅ 已启用自定义 aiohttp 会话')
-    except Exception as e:
-        logger.warning(f'⚠️ 初始化自定义 aiohttp 会话失败，将使用 discord.py 默认会话: {e}')
-        _aiohttp_session = None
 
 
 # --- 用户豁免期管理（60秒内允许发送任何内容） ---
@@ -559,6 +541,16 @@ async def on_ready():
 
 
 @client.event
+async def on_disconnect():
+    logger.warning('⚠️ 与 Discord 网关断开连接')
+
+
+@client.event
+async def on_resumed():
+    logger.info('✅ 与 Discord 网关恢复会话')
+
+
+@client.event
 async def on_message(message: discord.Message):
     """监听消息事件：检测是否含有链接，没有则删除并发送短暂提示"""
     
@@ -733,5 +725,9 @@ if __name__ == '__main__':
         raise SystemExit(1)
     
     logger.info("🚀 正在启动 Discord Bot...")
-    client.run(TOKEN)
+    try:
+        client.run(TOKEN)
+    except Exception:
+        logger.exception('❌ Bot 进程异常退出')
+        raise
 
