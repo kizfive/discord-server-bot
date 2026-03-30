@@ -414,7 +414,14 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
         log_user = await client.fetch_user(LOG_USER_ID)
         
         has_link = message_has_link(message)
-        content_preview = (message.content[:200] + '...') if len(message.content) > 200 else (message.content or '（空消息）')
+        
+        # --- 优化内容预览：如果没有文本但有附件，提示包含附件 ---
+        if message.content:
+            content_preview = (message.content[:200] + '...') if len(message.content) > 200 else message.content
+        elif message.attachments:
+            content_preview = f"（空消息，包含 {len(message.attachments)} 个附件）"
+        else:
+            content_preview = "（空消息）"
 
         embed = discord.Embed(
             title="📡 消息审计上报",
@@ -448,8 +455,6 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
             inline=False
         )
         
-        embed.add_field(name="🔗 原消息链接", value=message.jump_url, inline=False)
-        
         embed.add_field(
             name="🔧 执行的操作",
             value=action,
@@ -462,11 +467,25 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
             inline=False
         )
         
-        embed.set_footer(text=f"Zeabur Discord Bot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        embed.set_footer(text=f"Notess's Discord Bot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        await log_user.send(embed=embed)
+        # --- 将所有图片作为独立 Embed 打包发送（最多额外添加 9 张，Discord 单条消息最多 10 个 Embed）---
+        embeds_to_send = [embed]
+        image_attachments = [att for att in message.attachments if is_image_attachment(att)]
+        for img_att in image_attachments[:9]:
+            img_embed = discord.Embed(color=discord.Color.red())
+            img_embed.set_image(url=img_att.url)
+            embeds_to_send.append(img_embed)
+        
+        await log_user.send(embeds=embeds_to_send)
 
-        # 对删除类操作发送完整内容和附件
+        # 如果图片数量极端超过9张（正常不会发生），把剩下的再单独发出去
+        for img_att in image_attachments[9:]:
+            img_embed = discord.Embed(color=discord.Color.red())
+            img_embed.set_image(url=img_att.url)
+            await log_user.send(embed=img_embed)
+
+        # 对删除类操作发送完整文本和附件原始链接及详情（便于追溯）
         if ('撤回' in action) or ('删除' in action):
             if message.content:
                 text_chunks = chunk_text(message.content, max_len=1800)
@@ -485,16 +504,6 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
 
                 for chunk in chunk_text('\n'.join(attachment_lines), max_len=1800):
                     await log_user.send(f"📎 原消息附件列表\n```\n{chunk}\n```")
-
-                for attachment in message.attachments:
-                    if is_image_attachment(attachment):
-                        image_embed = discord.Embed(
-                            title=f"🖼️ 图片附件: {attachment.filename}",
-                            color=discord.Color.orange(),
-                            timestamp=datetime.now()
-                        )
-                        image_embed.set_image(url=attachment.url)
-                        await log_user.send(embed=image_embed)
 
         logger.info(f"✅ 日志已私聊发送至用户 ID {LOG_USER_ID}")
         
