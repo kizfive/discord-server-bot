@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"d:\\\\\\\\Server\\\\\\\\discord-server-bot\\\\\\\\.venv\\\\\\\\Scripts\\\\\\\\python.exe\" -m py_compile \"d:\\\\\\\\Server\\\\\\\\discord-server-bot\\\\\\\\bot1.py\")"
+    ]
+  }
+}

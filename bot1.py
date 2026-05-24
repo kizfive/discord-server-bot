@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 import discord
 from discord import Forbidden, HTTPException
@@ -80,6 +81,34 @@ def parse_channel_ids(value) -> set:
     return channel_ids
 
 
+def load_watched_channel_ids(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        channel_ids = data.get('channel_ids', [])
+        if not isinstance(channel_ids, list):
+            return None
+        return {parsed for ch_id in channel_ids if (parsed := parse_int(ch_id, default=None))}
+    except Exception as e:
+        logger.warning(f'⚠️ 无法读取监听频道持久化文件 {path}: {e}')
+        return None
+
+
+def save_watched_channel_ids(path: str, channel_ids: set):
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = f'{path}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'channel_ids': sorted(channel_ids)}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f'⚠️ 无法保存监听频道持久化文件 {path}: {e}')
+
+
 def parse_report_time(value: str) -> tuple:
     """解析每日播报时间，格式 HH:MM。"""
     default_hour, default_minute = 9, 0
@@ -124,6 +153,74 @@ def is_image_attachment(attachment: discord.Attachment) -> bool:
     filename = (attachment.filename or '').lower()
     return filename.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))
 
+
+def is_configured_admin(user_id: int) -> bool:
+    return ADMIN_USER_ID is not None and user_id == ADMIN_USER_ID
+
+
+def is_authorized_interaction(interaction: discord.Interaction) -> bool:
+    return is_configured_admin(interaction.user.id)
+
+
+def is_message_moderator(message: discord.Message) -> bool:
+    if is_configured_admin(message.author.id):
+        return True
+    if message.guild and message.guild.owner_id == message.author.id:
+        return True
+    if getattr(message.channel, 'owner_id', None) == message.author.id:
+        return True
+    permissions = getattr(message.author, 'guild_permissions', None)
+    return bool(
+        permissions and
+        (permissions.administrator or permissions.manage_messages or permissions.manage_channels)
+    )
+
+
+def save_current_watched_channels():
+    save_watched_channel_ids(WATCHED_CHANNELS_FILE, CHANNEL_IDS)
+
+
+def add_watched_channel(channel_id: int):
+    CHANNEL_IDS.add(channel_id)
+    save_current_watched_channels()
+
+
+def remove_watched_channel(channel_id: int):
+    CHANNEL_IDS.remove(channel_id)
+    save_current_watched_channels()
+
+
+def describe_channel(channel) -> str:
+    channel_id = getattr(channel, 'id', 'Unknown')
+    channel_name = getattr(channel, 'name', str(channel_id))
+    guild = getattr(channel, 'guild', None)
+    guild_name = getattr(guild, 'name', '未知服务器') if guild else '未知服务器'
+    guild_id = getattr(guild, 'id', 'Unknown') if guild else 'Unknown'
+    return f"#{channel_name} | 频道ID: {channel_id} | 服务器: {guild_name} ({guild_id})"
+
+
+async def get_channel_description(channel_id: int) -> str:
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(channel_id)
+        except Exception:
+            channel = None
+    if channel is None:
+        return f"未知频道 | 频道ID: {channel_id} | 服务器: 未知/不可访问"
+    return describe_channel(channel)
+
+
+async def build_watched_channel_list() -> str:
+    if not CHANNEL_IDS:
+        return "当前监听：所有 Bot 可见频道（监听列表为空）"
+    descriptions = [await get_channel_description(channel_id) for channel_id in sorted(CHANNEL_IDS)]
+    return "当前监听频道：\n" + "\n".join(f"- {desc}" for desc in descriptions)
+
+
+async def respond_unauthorized(interaction: discord.Interaction):
+    await interaction.response.send_message('你没有权限使用这个命令。', ephemeral=True)
+
 # --- URL 检测正则表达式 ---
 URL_PATTERN = re.compile(r'https?://|www\.', re.IGNORECASE)
 
@@ -132,10 +229,15 @@ TOKEN = get_config_value('DISCORD_TOKEN')
 
 # 支持多频道：用逗号分隔，如 "123456789,987654321,555666777"
 CHANNEL_IDS_STR = get_config_value('DISCORD_CHANNEL_ID', '0')
-CHANNEL_IDS = parse_channel_ids(CHANNEL_IDS_STR)
+WATCHED_CHANNELS_FILE = str(get_config_value('DISCORD_WATCHED_CHANNELS_FILE', 'data/watched_channels.json'))
+PERSISTED_CHANNEL_IDS = load_watched_channel_ids(WATCHED_CHANNELS_FILE)
+CHANNEL_IDS = PERSISTED_CHANNEL_IDS if PERSISTED_CHANNEL_IDS is not None else parse_channel_ids(CHANNEL_IDS_STR)
 
 # 日志接收用户 ID（用于私聊发送操作日志）
 LOG_USER_ID = parse_int(get_config_value('DISCORD_LOG_USER_ID', ''), default=None)
+
+# Bot 管理员用户 ID（用于热更新监听频道，也视为审核管理员）
+ADMIN_USER_ID = parse_int(get_config_value('DISCORD_ADMIN_USER_ID', ''), default=None)
 
 # 每日播报配置：可指定频道或用户（二选一也可同时设置）
 REPORT_CHANNEL_ID = parse_int(get_config_value('DISCORD_REPORT_CHANNEL_ID', ''), default=None)
@@ -145,10 +247,15 @@ REPORT_HOUR, REPORT_MINUTE = parse_report_time(REPORT_TIME_RAW)
 DISCORD_PROXY = get_config_value('DISCORD_PROXY', None)
 
 logger.info(f'监听的频道 ID 列表: {CHANNEL_IDS if CHANNEL_IDS else "所有频道"}')
+logger.info(f'监听频道持久化文件: {WATCHED_CHANNELS_FILE}')
 if LOG_USER_ID:
     logger.info(f'日志将私聊发送至用户 ID: {LOG_USER_ID}')
 else:
     logger.info('未配置日志接收用户，仅保存本地日志文件')
+if ADMIN_USER_ID:
+    logger.info(f'Bot 管理员用户 ID: {ADMIN_USER_ID}')
+else:
+    logger.info('未配置 Bot 管理员用户 ID（DISCORD_ADMIN_USER_ID），频道热更新命令不可用')
 if REPORT_CHANNEL_ID or REPORT_USER_ID:
     logger.info(
         f'每日播报已启用: 时间={REPORT_HOUR:02d}:{REPORT_MINUTE:02d}, '
@@ -332,6 +439,43 @@ async def send_daily_report(reason: str = '定时播报'):
     logger.info(f'✅ 日报已发送到 {target_name}')
 
 
+async def cleanup_old_files_loop():
+    """后台循环：每天清理过期文件（日志 14 天，下载附件 7 天）。"""
+    await client.wait_until_ready()
+    log_dir = 'logs'
+    attachments_dir = 'data/attachments'
+    log_retention = 14
+    attachment_retention = 7
+    while not client.is_closed():
+        try:
+            now = datetime.now()
+            total = 0
+
+            for directory, retention_days, label in [
+                (log_dir, log_retention, '.log'),
+                (attachments_dir, attachment_retention, ''),
+            ]:
+                if not os.path.isdir(directory):
+                    continue
+                for filename in os.listdir(directory):
+                    if label and not filename.endswith(label):
+                        continue
+                    filepath = os.path.join(directory, filename)
+                    try:
+                        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                        if (now - mtime).days >= retention_days:
+                            os.remove(filepath)
+                            total += 1
+                    except OSError:
+                        pass
+
+            if total:
+                logger.info(f'🧹 已清理 {total} 个过期文件（日志>{log_retention}d / 附件>{attachment_retention}d）')
+        except Exception as e:
+            logger.warning(f'⚠️ 文件清理失败: {e}')
+        await asyncio.sleep(86400)
+
+
 async def daily_report_loop():
     """后台循环：每天在指定时间发送状态报告。"""
     await client.wait_until_ready()
@@ -405,36 +549,86 @@ def log_message_info(message: discord.Message, has_link: bool, reason: str = Non
     logger.info(log_msg)
 
 
+async def build_attachment_files(attachments: list[discord.Attachment]) -> tuple[list[discord.File], list[str]]:
+    files = []
+    failed = []
+    attachments_dir = 'data/attachments'
+    os.makedirs(attachments_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    for i, attachment in enumerate(attachments):
+        if not is_image_attachment(attachment):
+            failed.append(f'{attachment.filename} | {attachment.size} bytes | {attachment.url}')
+            continue
+        try:
+            filepath = os.path.join(attachments_dir, f'{timestamp}_{i}_{attachment.filename}')
+            await attachment.save(open(filepath, 'wb'), use_cached=True)
+            files.append(discord.File(filepath, filename=attachment.filename))
+        except Exception as e:
+            failed.append(f'{attachment.filename} | {attachment.size} bytes | {attachment.url}')
+            logger.warning(f'⚠️ 无法还原附件 {attachment.filename}: {e}')
+    return files, failed
+
+
+async def send_deleted_message_content(log_user: discord.User, message: discord.Message):
+    header = (
+        f"📝 被撤回消息原文\n"
+        f"发送者: {message.author.mention} ({message.author.id})\n"
+        f"频道: #{getattr(message.channel, 'name', 'DM')} ({message.channel.id})"
+    )
+    chunks = chunk_text(message.content, max_len=1700) if message.content else ['（空文本消息）']
+    files, failed = await build_attachment_files(message.attachments)
+
+    for idx, chunk in enumerate(chunks, 1):
+        chunk_header = header if idx == 1 else f"📝 被撤回消息原文续 ({idx}/{len(chunks)})"
+        send_files = files[:10] if idx == 1 and files else None
+        await log_user.send(content=f"{chunk_header}\n>>> {chunk}", files=send_files)
+
+    if len(files) > 10:
+        for index in range(10, len(files), 10):
+            await log_user.send(content='📦 被撤回消息附件还原（续）', files=files[index:index + 10])
+
+    if message.attachments:
+        attachment_lines = []
+        for index, attachment in enumerate(message.attachments, 1):
+            attachment_lines.append(f"{index}. {attachment.filename} | {attachment.size} bytes | {attachment.url}")
+        for chunk in chunk_text('\n'.join(attachment_lines), max_len=1800):
+            await log_user.send(f"📎 被撤回消息附件列表\n```\n{chunk}\n```")
+
+    if failed:
+        for chunk in chunk_text('\n'.join(failed), max_len=1800):
+            await log_user.send(f"⚠️ 以下附件未能重新上传，仅保留原链接\n```\n{chunk}\n```")
+
+    if message.attachments and not files:
+        for attachment in message.attachments:
+            if is_image_attachment(attachment):
+                img_embed = discord.Embed(title=f"🖼️ 图片预览：{attachment.filename}", color=discord.Color.red())
+                img_embed.set_image(url=attachment.url)
+                await log_user.send(embed=img_embed)
+
+
 async def send_dm_log(message: discord.Message, action: str, result: str):
     """发送消息审计日志到指定用户的 DM。"""
     if not LOG_USER_ID:
         return
-    
+
     try:
         log_user = await client.fetch_user(LOG_USER_ID)
-        
+
         has_link = message_has_link(message)
-        
-        # --- 优化内容预览：如果没有文本但有附件，提示包含附件 ---
-        if message.content:
-            content_preview = (message.content[:200] + '...') if len(message.content) > 200 else message.content
-        elif message.attachments:
-            content_preview = f"（空消息，包含 {len(message.attachments)} 个附件）"
-        else:
-            content_preview = "（空消息）"
 
         embed = discord.Embed(
             title="📡 消息审计上报",
             color=discord.Color.red(),
             timestamp=datetime.now()
         )
-        
+
         embed.add_field(
-            name="👤 违规用户",
+            name="👤 用户",
             value=f"{message.author.mention}\n{message.author.name}#{message.author.discriminator}\nID: {message.author.id}",
             inline=False
         )
-        
+
         guild_name = getattr(message.guild, 'name', 'Direct Message')
         channel_name = getattr(message.channel, 'name', 'DM')
         embed.add_field(
@@ -450,63 +644,32 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
         )
 
         embed.add_field(
-            name="🧾 内容预览",
-            value=content_preview,
+            name="📄 消息摘要",
+            value=f"文本长度: {len(message.content or '')} 字符\n附件数量: {len(message.attachments)} 个",
             inline=False
         )
-        
+
         embed.add_field(
             name="🔧 执行的操作",
             value=action,
             inline=False
         )
-        
+
         embed.add_field(
             name="✅ 操作结果",
             value=result,
             inline=False
         )
-        
+
         embed.set_footer(text=f"Notess's Discord Bot | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # --- 将所有图片作为独立 Embed 打包发送（最多额外添加 9 张，Discord 单条消息最多 10 个 Embed）---
-        embeds_to_send = [embed]
-        image_attachments = [att for att in message.attachments if is_image_attachment(att)]
-        for img_att in image_attachments[:9]:
-            img_embed = discord.Embed(color=discord.Color.red())
-            img_embed.set_image(url=img_att.url)
-            embeds_to_send.append(img_embed)
-        
-        await log_user.send(embeds=embeds_to_send)
 
-        # 如果图片数量极端超过9张（正常不会发生），把剩下的再单独发出去
-        for img_att in image_attachments[9:]:
-            img_embed = discord.Embed(color=discord.Color.red())
-            img_embed.set_image(url=img_att.url)
-            await log_user.send(embed=img_embed)
+        await log_user.send(embed=embed)
 
-        # 对删除类操作发送完整文本和附件原始链接及详情（便于追溯）
         if ('撤回' in action) or ('删除' in action):
-            if message.content:
-                text_chunks = chunk_text(message.content, max_len=1800)
-                total_chunks = len(text_chunks)
-                for idx, chunk in enumerate(text_chunks, 1):
-                    await log_user.send(f"📝 原消息文本 ({idx}/{total_chunks})\n```\n{chunk}\n```")
-            else:
-                await log_user.send("📝 原消息文本： （空消息）")
-
-            if message.attachments:
-                attachment_lines = []
-                for index, attachment in enumerate(message.attachments, 1):
-                    attachment_lines.append(
-                        f"{index}. {attachment.filename} | {attachment.size} bytes | {attachment.url}"
-                    )
-
-                for chunk in chunk_text('\n'.join(attachment_lines), max_len=1800):
-                    await log_user.send(f"📎 原消息附件列表\n```\n{chunk}\n```")
+            await send_deleted_message_content(log_user, message)
 
         logger.info(f"✅ 日志已私聊发送至用户 ID {LOG_USER_ID}")
-        
+
     except Exception as e:
         logger.error(f"❌ 无法发送日志 DM: {e}")
 
@@ -531,6 +694,60 @@ async def ping_command(interaction: discord.Interaction):
     )
 
 
+@tree.command(name='list', description='查看当前正在监听的频道')
+async def list_command(interaction: discord.Interaction):
+    if not is_authorized_interaction(interaction):
+        await respond_unauthorized(interaction)
+        return
+
+    await interaction.response.send_message(await build_watched_channel_list(), ephemeral=True)
+
+
+@tree.command(name='watch_add', description='通过频道 ID 添加监听频道')
+@app_commands.describe(channel_id='要添加监听的频道 ID')
+async def watch_add_command(interaction: discord.Interaction, channel_id: str):
+    if not is_authorized_interaction(interaction):
+        await respond_unauthorized(interaction)
+        return
+
+    parsed_channel_id = parse_int(channel_id, default=None)
+    if not parsed_channel_id:
+        await interaction.response.send_message('频道 ID 格式不正确。', ephemeral=True)
+        return
+
+    already_watched = parsed_channel_id in CHANNEL_IDS
+    add_watched_channel(parsed_channel_id)
+    description = await get_channel_description(parsed_channel_id)
+    watched_text = await build_watched_channel_list()
+    status = '已在监听列表中' if already_watched else '已添加监听'
+    logger.info(f'✅ {status}: {parsed_channel_id} by {interaction.user.id}')
+    await interaction.response.send_message(f'{status}：{description}\n\n{watched_text}', ephemeral=True)
+
+
+@tree.command(name='watch_remove', description='通过频道 ID 移除监听频道')
+@app_commands.describe(channel_id='要移除监听的频道 ID')
+async def watch_remove_command(interaction: discord.Interaction, channel_id: str):
+    if not is_authorized_interaction(interaction):
+        await respond_unauthorized(interaction)
+        return
+
+    parsed_channel_id = parse_int(channel_id, default=None)
+    if not parsed_channel_id:
+        await interaction.response.send_message('频道 ID 格式不正确。', ephemeral=True)
+        return
+
+    if parsed_channel_id not in CHANNEL_IDS:
+        await interaction.response.send_message(f'该频道 ID 不在监听列表中：{parsed_channel_id}', ephemeral=True)
+        return
+
+    description = await get_channel_description(parsed_channel_id)
+    remove_watched_channel(parsed_channel_id)
+    watched_text = await build_watched_channel_list()
+    extra = '\n注意：监听列表已为空，Bot 将监听所有可见频道。' if not CHANNEL_IDS else ''
+    logger.info(f'✅ 已移除监听频道 ID: {parsed_channel_id} by {interaction.user.id}')
+    await interaction.response.send_message(f'已移除监听：{description}{extra}\n\n{watched_text}', ephemeral=True)
+
+
 @client.event
 async def on_ready():
     global daily_report_task, slash_command_synced
@@ -547,6 +764,11 @@ async def on_ready():
     if daily_report_task is None or daily_report_task.done():
         daily_report_task = asyncio.create_task(daily_report_loop())
         logger.info('✅ 每日播报任务已启动')
+
+    if not hasattr(client, '_cleanup_task_started'):
+        client._cleanup_task_started = True
+        asyncio.create_task(cleanup_old_files_loop())
+        logger.info('✅ 日志自动清理任务已启动（保留 7 天）')
 
 
 @client.event
@@ -576,19 +798,35 @@ async def on_message(message: discord.Message):
 
     ensure_daily_stats_date()
     daily_stats['checked'] += 1
-    
-    has_link = message_has_link(message)
-    
-    # 检查是否为管理员或拥有管理消息权限
-    is_admin = (
-        hasattr(message.author, 'guild_permissions') and
-        (message.author.guild_permissions.administrator or 
-         message.author.guild_permissions.manage_messages)
-    )
-    
+
+    # 先判断发送者是否为管理员/频道主（豁免所有合规检查）
+    if is_message_moderator(message):
+        has_link = message_has_link(message)
+        log_message_info(message, has_link, "✅ 已通过 - 发送者为管理员/频道主（豁免规则）")
+        daily_stats['allowed_admin'] += 1
+        await send_dm_log(
+            message,
+            "发送者为管理员/频道主，跳过内容合规性处理",
+            "✅ 已通过（管理员/频道主豁免）"
+        )
+        return
+
     # 检查用户是否在豁免期内
     is_exempt = is_user_exempt(message.author.id, message.channel.id)
-    
+    if is_exempt:
+        remaining_seconds = get_exemption_remaining_seconds(message.author.id, message.channel.id)
+        has_link = message_has_link(message)
+        log_message_info(message, has_link, f"✅ 已通过 - 发送者在豁免期内")
+        daily_stats['allowed_exempt'] += 1
+        await send_dm_log(
+            message,
+            "用户发送消息，处于豁免期",
+            f"✅ 已通过（剩余豁免约 {remaining_seconds} 秒）"
+        )
+        return
+
+    has_link = message_has_link(message)
+
     # 记录包含链接的消息（直接通过）
     if has_link:
         log_message_info(message, True, "✅ 已通过 - 消息包含有效链接")
@@ -600,29 +838,6 @@ async def on_message(message: discord.Message):
             message,
             "用户发送消息，包含链接，给予通过并授予豁免期",
             f"✅ 已通过，并获得 {EXEMPTION_SECONDS} 秒豁免期"
-        )
-        return
-    
-    # 记录不含链接但是管理员的消息（直接通过）
-    if is_admin:
-        log_message_info(message, False, "✅ 已通过 - 发送者为管理员/版主（豁免规则）")
-        daily_stats['allowed_admin'] += 1
-        await send_dm_log(
-            message,
-            "用户发送消息，不包含链接，发送者为管理员，不进行检测",
-            "✅ 已通过（管理员/版主豁免）"
-        )
-        return
-    
-    # 如果用户在豁免期内，允许发送任何内容（包括纯文本、图片等）
-    if is_exempt:
-        remaining_seconds = get_exemption_remaining_seconds(message.author.id, message.channel.id)
-        log_message_info(message, False, f"✅ 已通过 - 发送者在豁免期内")
-        daily_stats['allowed_exempt'] += 1
-        await send_dm_log(
-            message,
-            "用户发送消息，不包含链接，但处于豁免期",
-            f"✅ 已通过（剩余豁免约 {remaining_seconds} 秒）"
         )
         return
     
