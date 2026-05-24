@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import logging
 import discord
@@ -440,39 +441,30 @@ async def send_daily_report(reason: str = '定时播报'):
 
 
 async def cleanup_old_files_loop():
-    """后台循环：每天清理过期文件（日志 14 天，下载附件 7 天）。"""
+    """后台循环：每天清理 logs/ 中超过 14 天的日志文件。"""
     await client.wait_until_ready()
     log_dir = 'logs'
-    attachments_dir = 'data/attachments'
-    log_retention = 14
-    attachment_retention = 7
+    retention_days = 14
     while not client.is_closed():
         try:
             now = datetime.now()
-            total = 0
-
-            for directory, retention_days, label in [
-                (log_dir, log_retention, '.log'),
-                (attachments_dir, attachment_retention, ''),
-            ]:
-                if not os.path.isdir(directory):
-                    continue
-                for filename in os.listdir(directory):
-                    if label and not filename.endswith(label):
+            count = 0
+            if os.path.isdir(log_dir):
+                for filename in os.listdir(log_dir):
+                    if not filename.endswith('.log'):
                         continue
-                    filepath = os.path.join(directory, filename)
+                    filepath = os.path.join(log_dir, filename)
                     try:
                         mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
                         if (now - mtime).days >= retention_days:
                             os.remove(filepath)
-                            total += 1
+                            count += 1
                     except OSError:
                         pass
-
-            if total:
-                logger.info(f'🧹 已清理 {total} 个过期文件（日志>{log_retention}d / 附件>{attachment_retention}d）')
+            if count:
+                logger.info(f'🧹 已清理 {count} 个超过 {retention_days} 天的日志文件')
         except Exception as e:
-            logger.warning(f'⚠️ 文件清理失败: {e}')
+            logger.warning(f'⚠️ 日志清理失败: {e}')
         await asyncio.sleep(86400)
 
 
@@ -552,18 +544,12 @@ def log_message_info(message: discord.Message, has_link: bool, reason: str = Non
 async def build_attachment_files(attachments: list[discord.Attachment]) -> tuple[list[discord.File], list[str]]:
     files = []
     failed = []
-    attachments_dir = 'data/attachments'
-    os.makedirs(attachments_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-    for i, attachment in enumerate(attachments):
+    for attachment in attachments:
         if not is_image_attachment(attachment):
-            failed.append(f'{attachment.filename} | {attachment.size} bytes | {attachment.url}')
             continue
         try:
-            filepath = os.path.join(attachments_dir, f'{timestamp}_{i}_{attachment.filename}')
-            await attachment.save(open(filepath, 'wb'), use_cached=True)
-            files.append(discord.File(filepath, filename=attachment.filename))
+            data = await attachment.read(use_cached=True)
+            files.append(discord.File(io.BytesIO(data), filename=attachment.filename))
         except Exception as e:
             failed.append(f'{attachment.filename} | {attachment.size} bytes | {attachment.url}')
             logger.warning(f'⚠️ 无法还原附件 {attachment.filename}: {e}')
@@ -846,18 +832,18 @@ async def on_message(message: discord.Message):
     
     try:
         global total_deleted
-        # 删除无链接消息
-        await message.delete()
-        logger.info(f"✅ 操作成功：消息已删除")
-        daily_stats['deleted'] += 1
-        total_deleted += 1
-        
-        # 发送删除操作日志到指定用户
+
+        # 先发送删除操作日志（含附件下载），再删除消息
         await send_dm_log(
             message,
             "用户发送消息，不包含链接，已撤回消息并附带原消息内容",
             "✅ 消息已成功撤回"
         )
+
+        await message.delete()
+        logger.info(f"✅ 操作成功：消息已删除")
+        daily_stats['deleted'] += 1
+        total_deleted += 1
         
         # 在频道中发送删除提醒 Embed（仅用户短时间内可见）
         try:
