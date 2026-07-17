@@ -297,63 +297,72 @@ EXEMPTION_SECONDS = 60
 
 # --- 用户豁免期管理（60秒内允许发送任何内容） ---
 user_exemptions = {}  # {user_id: {"expires_at": datetime, "channel_ids": set()}}
+_exemption_lock = asyncio.Lock()  # 保护豁免期字典的并发访问
 
-def is_user_exempt(user_id: int, channel_id: int) -> bool:
-    """检查用户是否在豁免期内"""
-    if user_id not in user_exemptions:
-        return False
-    
-    exemption = user_exemptions[user_id]
-    
-    # 检查是否过期
-    if datetime.now() > exemption["expires_at"]:
-        del user_exemptions[user_id]
-        return False
-    
-    # 检查是否在该频道有豁免
-    return channel_id in exemption["channel_ids"]
+async def is_user_exempt(user_id: int, channel_id: int) -> bool:
+    """检查用户是否在豁免期内（线程安全）"""
+    async with _exemption_lock:
+        if user_id not in user_exemptions:
+            return False
 
-def grant_exemption(user_id: int, channel_id: int, duration_seconds: int = 60):
+        exemption = user_exemptions[user_id]
+
+        # 检查是否过期
+        if datetime.now() > exemption["expires_at"]:
+            del user_exemptions[user_id]
+            return False
+
+        # 检查是否在该频道有豁免
+        return channel_id in exemption["channel_ids"]
+
+async def grant_exemption(user_id: int, channel_id: int, duration_seconds: int = 60):
     """授予用户豁免期（在指定频道内可以发送任何内容）"""
     expires_at = datetime.now() + timedelta(seconds=duration_seconds)
-    
-    if user_id not in user_exemptions:
-        user_exemptions[user_id] = {
-            "expires_at": expires_at,
-            "channel_ids": set()
-        }
-    else:
-        # 更新过期时间为更晚的时间
-        user_exemptions[user_id]["expires_at"] = max(
-            user_exemptions[user_id]["expires_at"],
-            expires_at
-        )
-    
-    # 添加频道
-    user_exemptions[user_id]["channel_ids"].add(channel_id)
-    logger.info(f"✅ 授予用户 {user_id} 在频道 {channel_id} 60秒的豁免期")
 
-def cleanup_expired_exemptions():
-    """清理过期的豁免期"""
+    async with _exemption_lock:
+        if user_id not in user_exemptions:
+            user_exemptions[user_id] = {
+                "expires_at": expires_at,
+                "channel_ids": set()
+            }
+        else:
+            # 更新过期时间为更晚的时间
+            user_exemptions[user_id]["expires_at"] = max(
+                user_exemptions[user_id]["expires_at"],
+                expires_at
+            )
+
+        # 添加频道
+        user_exemptions[user_id]["channel_ids"].add(channel_id)
+
+    logger.info(f"✅ 授予用户 {user_id} 在频道 {channel_id} {duration_seconds}秒的豁免期")
+
+async def cleanup_expired_exemptions():
+    """清理过期的豁免期（线程安全）"""
     now = datetime.now()
-    expired_users = [
-        uid for uid, data in user_exemptions.items()
-        if now > data["expires_at"]
-    ]
-    for uid in expired_users:
-        del user_exemptions[uid]
+    async with _exemption_lock:
+        expired_users = [
+            uid for uid, data in user_exemptions.items()
+            if now > data["expires_at"]
+        ]
+        for uid in expired_users:
+            try:
+                del user_exemptions[uid]
+            except KeyError:
+                pass  # 其他协程可能已经删除了该条目
     if expired_users:
         logger.debug(f"🧹 清理了 {len(expired_users)} 个过期的豁免期")
 
 
-def get_exemption_remaining_seconds(user_id: int, channel_id: int) -> int:
+async def get_exemption_remaining_seconds(user_id: int, channel_id: int) -> int:
     """返回用户在频道中的剩余豁免秒数。"""
-    exemption = user_exemptions.get(user_id)
-    if not exemption:
-        return 0
-    if channel_id not in exemption.get("channel_ids", set()):
-        return 0
-    remaining = int((exemption["expires_at"] - datetime.now()).total_seconds())
+    async with _exemption_lock:
+        exemption = user_exemptions.get(user_id)
+        if not exemption:
+            return 0
+        if channel_id not in exemption.get("channel_ids", set()):
+            return 0
+        remaining = int((exemption["expires_at"] - datetime.now()).total_seconds())
     return max(remaining, 0)
 
 
@@ -492,11 +501,12 @@ async def daily_report_loop():
 
 
 def message_has_link(message: discord.Message) -> bool:
-    """检查消息是否包含链接：仅通过文本内的 URL 判断（不包括纯附件）"""
-    # 只检查文本内容中的 URL
+    """检查消息是否包含链接：通过文本内容和嵌入内容判断"""
+    # 检查消息文本中的 URL
     if message.content and URL_PATTERN.search(message.content):
         return True
-    # 嵌入内容中的链接
+
+    # 检查嵌入内容中的链接
     for emb in message.embeds:
         try:
             parts = []
@@ -506,6 +516,24 @@ def message_has_link(message: discord.Message) -> bool:
                 parts.append(emb.description)
             if getattr(emb, 'url', None):
                 parts.append(str(emb.url))
+            # 检查 embed 字段中的链接
+            for field in getattr(emb, 'fields', []):
+                if getattr(field, 'name', None):
+                    parts.append(field.name)
+                if getattr(field, 'value', None):
+                    parts.append(field.value)
+            # 检查 embed footer
+            footer = getattr(emb, 'footer', None)
+            if footer and getattr(footer, 'text', None):
+                parts.append(footer.text)
+            # 检查 embed author
+            author = getattr(emb, 'author', None)
+            if author:
+                if getattr(author, 'name', None):
+                    parts.append(author.name)
+                if getattr(author, 'url', None):
+                    parts.append(str(author.url))
+
             combined = ' '.join(parts)
             if combined and URL_PATTERN.search(combined):
                 return True
@@ -514,11 +542,18 @@ def message_has_link(message: discord.Message) -> bool:
     return False
 
 
+def format_author(message: discord.Message) -> str:
+    """格式化作者显示名，兼容新旧用户名系统"""
+    try:
+        return str(message.author)
+    except Exception:
+        return f"{message.author.name}#{getattr(message.author, 'discriminator', '0000')}"
+
 def log_message_info(message: discord.Message, has_link: bool, reason: str = None):
     """记录消息处理的详细信息"""
     channel_name = getattr(message.channel, 'name', 'Unknown')
     guild_name = getattr(message.guild, 'name', 'Unknown Guild')
-    author_name = f"{message.author.name}#{message.author.discriminator}"
+    author_name = format_author(message)
     content_preview = (message.content[:100] + '...') if len(message.content) > 100 else message.content
     
     compliance = "✅ 合规（含链接）" if has_link else "❌ 不合规（无链接）"
@@ -611,7 +646,7 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
 
         embed.add_field(
             name="👤 用户",
-            value=f"{message.author.mention}\n{message.author.name}#{message.author.discriminator}\nID: {message.author.id}",
+            value=f"{message.author.mention}\n{format_author(message)}\nID: {message.author.id}",
             inline=False
         )
 
@@ -629,10 +664,17 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
             inline=True
         )
 
+        content_preview = (message.content[:200] + '...') if len(message.content) > 200 else message.content
         embed.add_field(
-            name="📄 消息摘要",
-            value=f"文本长度: {len(message.content or '')} 字符\n附件数量: {len(message.attachments)} 个",
+            name="💬 原消息内容",
+            value=f"```\n{content_preview}\n```" if content_preview else "（空消息）",
             inline=False
+        )
+
+        embed.add_field(
+            name="📎 附件",
+            value=f"{len(message.attachments)} 个" if message.attachments else "无",
+            inline=True
         )
 
         embed.add_field(
@@ -651,13 +693,18 @@ async def send_dm_log(message: discord.Message, action: str, result: str):
 
         await log_user.send(embed=embed)
 
+        # 仅被撤回/删除的消息转发原文和附件（通过的消息只保留在 embed 预览中）
         if ('撤回' in action) or ('删除' in action):
             await send_deleted_message_content(log_user, message)
 
         logger.info(f"✅ 日志已私聊发送至用户 ID {LOG_USER_ID}")
 
+    except discord.NotFound:
+        logger.error(f"❌ 无法发送日志 DM: 用户 {LOG_USER_ID} 不存在")
+    except discord.Forbidden:
+        logger.error(f"❌ 无法发送日志 DM: Bot 被禁止向用户 {LOG_USER_ID} 发送私聊（用户可能关闭了「允许来自服务器成员的私聊」）")
     except Exception as e:
-        logger.error(f"❌ 无法发送日志 DM: {e}")
+        logger.error(f"❌ 无法发送日志 DM: {type(e).__name__} - {e}")
 
 
 @tree.command(name='ping', description='检查机器人运行状态与延迟')
@@ -770,133 +817,221 @@ async def on_resumed():
 @client.event
 async def on_message(message: discord.Message):
     """监听消息事件：检测是否含有链接，没有则删除并发送短暂提示"""
-    
-    # 清理过期的豁免期
-    cleanup_expired_exemptions()
-    
-    # 跳过 Bot 消息
-    if message.author.bot:
-        return
-    
-    # 检查是否监听此频道
-    if CHANNEL_IDS and message.channel.id not in CHANNEL_IDS:
-        return
-
-    ensure_daily_stats_date()
-    daily_stats['checked'] += 1
-
-    # 先判断发送者是否为管理员/频道主（豁免所有合规检查）
-    if is_message_moderator(message):
-        has_link = message_has_link(message)
-        log_message_info(message, has_link, "✅ 已通过 - 发送者为管理员/频道主（豁免规则）")
-        daily_stats['allowed_admin'] += 1
-        await send_dm_log(
-            message,
-            "发送者为管理员/频道主，跳过内容合规性处理",
-            "✅ 已通过（管理员/频道主豁免）"
-        )
-        return
-
-    # 检查用户是否在豁免期内
-    is_exempt = is_user_exempt(message.author.id, message.channel.id)
-    if is_exempt:
-        remaining_seconds = get_exemption_remaining_seconds(message.author.id, message.channel.id)
-        has_link = message_has_link(message)
-        log_message_info(message, has_link, f"✅ 已通过 - 发送者在豁免期内")
-        daily_stats['allowed_exempt'] += 1
-        await send_dm_log(
-            message,
-            "用户发送消息，处于豁免期",
-            f"✅ 已通过（剩余豁免约 {remaining_seconds} 秒）"
-        )
-        return
-
-    has_link = message_has_link(message)
-
-    # 记录包含链接的消息（直接通过）
-    if has_link:
-        log_message_info(message, True, "✅ 已通过 - 消息包含有效链接")
-        # 授予发送者 60 秒豁免期，允许发送任何内容
-        grant_exemption(message.author.id, message.channel.id, duration_seconds=EXEMPTION_SECONDS)
-        daily_stats['allowed_link'] += 1
-        daily_stats['exemption_granted'] += 1
-        await send_dm_log(
-            message,
-            "用户发送消息，包含链接，给予通过并授予豁免期",
-            f"✅ 已通过，并获得 {EXEMPTION_SECONDS} 秒豁免期"
-        )
-        return
-    
-    # 需要删除的消息
-    log_message_info(message, False, "⏳ 正在删除无链接消息...")
-    
     try:
-        global total_deleted
+        # 跳过 Bot 消息
+        if message.author.bot:
+            return
 
-        # 先发送删除操作日志（含附件下载），再删除消息
-        await send_dm_log(
-            message,
-            "用户发送消息，不包含链接，已撤回消息并附带原消息内容",
-            "✅ 消息已成功撤回"
+        # 跳过私聊消息（Bot 只处理服务器频道中的消息）
+        if not message.guild:
+            return
+
+        # 检查是否监听此频道
+        if CHANNEL_IDS and message.channel.id not in CHANNEL_IDS:
+            return
+
+        ensure_daily_stats_date()
+        daily_stats['checked'] += 1
+
+        # 清理过期的豁免期
+        await cleanup_expired_exemptions()
+
+        # 先判断发送者是否为管理员/频道主（豁免所有合规检查）
+        if is_message_moderator(message):
+            has_link = message_has_link(message)
+            log_message_info(message, has_link, "✅ 已通过 - 发送者为管理员/频道主（豁免规则）")
+            daily_stats['allowed_admin'] += 1
+            await send_dm_log(
+                message,
+                "发送者为管理员/频道主，跳过内容合规性处理",
+                "✅ 已通过（管理员/频道主豁免）"
+            )
+            return
+
+        # 检查用户是否在豁免期内
+        is_exempt = await is_user_exempt(message.author.id, message.channel.id)
+        if is_exempt:
+            remaining_seconds = await get_exemption_remaining_seconds(message.author.id, message.channel.id)
+            has_link = message_has_link(message)
+            log_message_info(message, has_link, f"✅ 已通过 - 发送者在豁免期内")
+            daily_stats['allowed_exempt'] += 1
+            await send_dm_log(
+                message,
+                "用户发送消息，处于豁免期",
+                f"✅ 已通过（剩余豁免约 {remaining_seconds} 秒）"
+            )
+            return
+
+        has_link = message_has_link(message)
+
+        # 记录包含链接的消息（直接通过）
+        if has_link:
+            log_message_info(message, True, "✅ 已通过 - 消息包含有效链接")
+            # 授予发送者 60 秒豁免期，允许发送任何内容
+            await grant_exemption(message.author.id, message.channel.id, duration_seconds=EXEMPTION_SECONDS)
+            daily_stats['allowed_link'] += 1
+            daily_stats['exemption_granted'] += 1
+            await send_dm_log(
+                message,
+                "用户发送消息，包含链接，给予通过并授予豁免期",
+                f"✅ 已通过，并获得 {EXEMPTION_SECONDS} 秒豁免期"
+            )
+            return
+
+        # 需要删除的消息
+        log_message_info(message, False, "⏳ 正在删除无链接消息...")
+
+        try:
+            global total_deleted
+
+            # 先发送删除操作日志（含附件下载），再删除消息
+            await send_dm_log(
+                message,
+                "用户发送消息，不包含链接，已撤回消息并附带原消息内容",
+                "✅ 消息已成功撤回"
+            )
+
+            await message.delete()
+            logger.info(f"✅ 操作成功：消息已删除")
+            daily_stats['deleted'] += 1
+            total_deleted += 1
+
+            # 在频道中发送删除提醒 Embed（仅用户短时间内可见）
+            try:
+                reminder_embed = discord.Embed(
+                    title="❌ 消息已删除",
+                    description="你的消息因为不符合频道规则而被删除。",
+                    color=discord.Color.red(),
+                    timestamp=datetime.now()
+                )
+                reminder_embed.add_field(
+                    name="📋 规则",
+                    value="此频道仅允许发送包含链接的消息。",
+                    inline=False
+                )
+                reminder_embed.set_footer(text="此提醒将在5秒后自动删除")
+
+                # 在频道发送提醒给用户
+                await message.channel.send(
+                    f'{message.author.mention}',
+                    embed=reminder_embed,
+                    delete_after=5  # 5秒后自动删除提醒
+                )
+                logger.info(f"✅ 删除提醒 Embed 已发送")
+            except Exception as e:
+                logger.warning(f"⚠️ 无法发送删除提醒 Embed: {e}")
+
+        except Forbidden:
+            daily_stats['errors'] += 1
+            error_msg = (
+                f"❌ 操作失败：Bot 缺少删除消息权限\n"
+                f"  频道 ID: {message.channel.id}\n"
+                f"  频道名: {getattr(message.channel, 'name', 'Unknown')}\n"
+                f"  请确保 Bot 在该频道有 '删除消息' 权限"
+            )
+            logger.error(error_msg)
+            await send_dm_log(
+                message,
+                "用户发送消息，不包含链接，尝试撤回消息",
+                "❌ 撤回失败 - Bot 缺少删除消息权限"
+            )
+        except HTTPException as e:
+            daily_stats['errors'] += 1
+            error_msg = f"❌ 操作失败：HTTP 错误 - {str(e)}"
+            logger.error(error_msg)
+            await send_dm_log(
+                message,
+                "用户发送消息，不包含链接，尝试撤回消息",
+                f"❌ 撤回失败 - HTTP 错误: {str(e)}"
+            )
+
+    except Exception as e:
+        daily_stats['errors'] += 1
+        # 记录消息信息便于排查
+        msg_id = getattr(message, 'id', 'N/A')
+        msg_author = getattr(message.author, 'id', 'N/A') if hasattr(message, 'author') else 'N/A'
+        msg_ch = getattr(message.channel, 'id', 'N/A') if hasattr(message, 'channel') else 'N/A'
+        logger.error(
+            f"❌ on_message 未预期异常 (msg_id={msg_id}, author={msg_author}, channel={msg_ch}): "
+            f"{type(e).__name__}: {e}",
+            exc_info=True
         )
+        try:
+            if 'message' in dir() and message.guild:
+                await send_dm_log(
+                    message,
+                    "处理消息时发生异常",
+                    f"❌ 未预期错误: {type(e).__name__}"
+                )
+        except Exception:
+            pass
 
-        await message.delete()
-        logger.info(f"✅ 操作成功：消息已删除")
-        daily_stats['deleted'] += 1
-        total_deleted += 1
-        
-        # 在频道中发送删除提醒 Embed（仅用户短时间内可见）
+
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """监听消息编辑事件：编辑后移除链接也需要处理"""
+    try:
+        # 跳过 Bot 消息
+        if after.author.bot:
+            return
+
+        # 跳过私聊
+        if not after.guild:
+            return
+
+        # 检查是否监听此频道
+        if CHANNEL_IDS and after.channel.id not in CHANNEL_IDS:
+            return
+
+        # 如果编辑后内容没变，不需要处理
+        if before.content == after.content:
+            return
+
+        has_link_now = message_has_link(after)
+
+        # 编辑后有了链接，授予豁免期（让它通过）
+        if has_link_now:
+            log_message_info(after, True, "✅ 编辑后已通过 - 消息包含有效链接")
+            await grant_exemption(after.author.id, after.channel.id, duration_seconds=EXEMPTION_SECONDS)
+            return
+
+        # 编辑后没有链接 → 检查用户是否有豁免
+        if is_message_moderator(after):
+            log_message_info(after, False, "✅ 编辑后已通过 - 发送者为管理员/频道主")
+            return
+
+        is_exempt = await is_user_exempt(after.author.id, after.channel.id)
+        if is_exempt:
+            log_message_info(after, False, f"✅ 编辑后已通过 - 发送者在豁免期内")
+            return
+
+        # 编辑后不符合规则 → 删除
+        log_message_info(after, False, "⏳ 编辑后无链接，正在删除...")
+        await after.delete()
+        logger.info(f"✅ 编辑后消息 {after.id} 已删除")
+        await send_dm_log(after, "删除编辑后无链接的消息", "✅ 消息已成功删除")
+
+        # 发送提醒
         try:
             reminder_embed = discord.Embed(
                 title="❌ 消息已删除",
-                description="你的消息因为不符合频道规则而被删除。",
+                description="你的消息编辑后不符合频道规则（必须包含链接）已被删除。",
                 color=discord.Color.red(),
                 timestamp=datetime.now()
             )
-            reminder_embed.add_field(
-                name="📋 规则",
-                value="此频道仅允许发送包含链接的消息。",
-                inline=False
-            )
-            # reminder_embed.add_field(
-            #     name="✅ 解决办法",
-            #     value="发送一条**包含链接的消息**后，你将获得60秒的豁免期，期间可以发送任何内容（包括纯图片）。",
-            #    inline=False
-            # )
             reminder_embed.set_footer(text="此提醒将在5秒后自动删除")
-            
-            # 在频道发送提醒给用户
-            tip = await message.channel.send(
-                f'{message.author.mention}',
+            await after.channel.send(
+                f'{after.author.mention}',
                 embed=reminder_embed,
-                delete_after=5  # 5秒后自动删除提醒
+                delete_after=5
             )
-            logger.info(f"✅ 删除提醒 Embed 已发送")
-        except Exception as e:
-            logger.warning(f"⚠️ 无法发送删除提醒 Embed: {e}")
-    
-    except Forbidden:
-        daily_stats['errors'] += 1
-        error_msg = (
-            f"❌ 操作失败：Bot 缺少删除消息权限\n"
-            f"  频道 ID: {message.channel.id}\n"
-            f"  频道名: {getattr(message.channel, 'name', 'Unknown')}\n"
-            f"  请确保 Bot 在该频道有 '删除消息' 权限"
-        )
-        logger.error(error_msg)
-        await send_dm_log(
-            message,
-            "用户发送消息，不包含链接，尝试撤回消息",
-            "❌ 撤回失败 - Bot 缺少删除消息权限"
-        )
-    except HTTPException as e:
-        daily_stats['errors'] += 1
-        error_msg = f"❌ 操作失败：HTTP 错误 - {str(e)}"
-        logger.error(error_msg)
-        await send_dm_log(
-            message,
-            "用户发送消息，不包含链接，尝试撤回消息",
-            f"❌ 撤回失败 - HTTP 错误: {str(e)}"
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(
+            f"❌ on_message_edit 异常: {type(e).__name__}: {e}",
+            exc_info=True
         )
 
 
